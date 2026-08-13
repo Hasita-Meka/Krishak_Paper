@@ -1,0 +1,39 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+conda/
+.claude/
+
+# Dataset images - download from Kaggle (see README)
+Dataset/train_images/
+Dataset/test_images/
+Dataset/aug_images/
+Dataset/sample_submission.csv
+
+# Large generated artifacts - regenerate via the pipeline scripts.
+# outputs/results/ (small json/csv) is intentionally NOT ignored - it's tracked.
+outputs/models/*.pth
+outputs/plots/
+outputs/logs/
+
+# Paper / journal submission assets - not part of the code repo
+Krishak_Elsevier/
+INPA_submission_forms/
+Krishak_SAT.zip
+krishak_paper*.tex
+Krishak_paper_verification_report.md
+references.bib
+/*.png
+
+# Stray duplicate file - superseded by outputs/results/gnas_summary.json
+/outputs/results/gnas_summary (1).json
+
+# Stray temp files (unzipped clipboard artifacts, not part of the project)
+/ziJru4MN
+/ziKSqdfu
+/ziUjhuZv
+/zid4VoUV
+/zinWeBJ4
+/zino15Vc
+
