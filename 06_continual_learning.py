@@ -118,7 +118,7 @@ _gnas_spec = _ilu.spec_from_file_location(
 _gnas_mod = _ilu.module_from_spec(_gnas_spec)
 _gnas_spec.loader.exec_module(_gnas_mod)
 _GNASQEFSExtractor    = _gnas_mod.QEFSFeatureExtractor   # CNN + GNAS QuantumInspiredLayer
-_GNASQuantumLayer     = _gnas_mod.QuantumInspiredLayer   # ent_fc + BN + ReLU version
+_GNASQuantumLayer     = _gnas_mod.QuantumInspiredLayer   # now the same class as 04_qefs (revision fix)
 _gnas_get_backbone_dim = _gnas_mod.get_backbone_dim
 
 
@@ -138,11 +138,29 @@ class _QEFSFeatureExtractor(nn.Module):
 # Task setup
 # ═══════════════════════════════════════════════════════════════════════════
 N_TASKS  = CL_N_TASKS      # 5
-TASKS    = [CLASS_NAMES[i*2:(i+1)*2] for i in range(N_TASKS)]
+# Task order (R1, R5 #4): 0 = original alphabetical pairing, k>0 = seeded permutation
+if CL_TASK_ORDER == 0:
+    _ORDERED = list(CLASS_NAMES)
+else:
+    _ORDERED = list(np.random.RandomState(CL_TASK_ORDER).permutation(CLASS_NAMES))
+TASKS    = [_ORDERED[i*2:(i+1)*2] for i in range(N_TASKS)]
+# Variant suffix so sweeps (order / seed / buffer / freeze / legacy A-GEM) never
+# overwrite the main run; the paper setting keeps the original file names.
+_AGEM_LEGACY = os.environ.get("KRISHAK_AGEM_LEGACY") == "1"
+_VARIANT_PARTS = []
+if CL_TASK_ORDER != 0:       _VARIANT_PARTS.append(f"o{CL_TASK_ORDER}")
+if SEED != 42:               _VARIANT_PARTS.append(f"s{SEED}")
+if CL_BUFFER_SIZE != 2000:   _VARIANT_PARTS.append(f"b{CL_BUFFER_SIZE}")
+if CL_FREEZE_MODE != "1":    _VARIANT_PARTS.append(f"f{CL_FREEZE_MODE}")
+if _AGEM_LEGACY:             _VARIANT_PARTS.append("agemlegacy")
+CL_VARIANT = ("_" + "_".join(_VARIANT_PARTS)) if _VARIANT_PARTS else ""
 # e.g. Task 0: [bacterial_leaf_blight, bacterial_leaf_streak], ...
 
 # CL_MODEL_NAME comes from config (default "resnet50"); override via config patch for tests
 BUFFER_SIZE     = CL_BUFFER_SIZE
+# Reference-parity switches (defaults = behaviour of the paper runs; used by the Split-CIFAR pilot)
+CL_GRAD_CLIP = float(os.environ.get("KRISHAK_CL_CLIP", "1.0"))   # 0 = no clipping (Mammoth reference)
+CL_REF_MODE  = os.environ.get("KRISHAK_CL_REF") == "1"           # DER++ exactly as in Buzzega et al.
 EPOCHS_PER_TASK = CL_EPOCHS_PER_TASK
 
 
@@ -213,14 +231,21 @@ class CLModel(nn.Module):
 
         # ── Backbone freezing (key for zero catastrophic forgetting) ─────────
         if _CL_FREEZE_BACKBONE:
-            n_frozen = 0
-            for param in self.backbone.parameters():
+            params = list(self.backbone.parameters())
+            for param in params:
                 param.requires_grad = False
-                n_frozen += 1
-            print(f"  [CL] Backbone FROZEN ({n_frozen} param groups) — "
-                  "only classification head will be trained.")
+            if CL_FREEZE_MODE == "partial":
+                n_open = max(1, int(round(0.2 * len(params))))
+                for param in params[-n_open:]:
+                    param.requires_grad = True
+                print(f"  [CL] Backbone PARTIAL — last {n_open}/{len(params)} parameter tensors trainable.")
+            else:
+                print(f"  [CL] Backbone FROZEN ({len(params)} param tensors) — "
+                      "only classification head will be trained.")
         else:
             print("  [CL] Backbone UNFROZEN — all parameters will be trained.")
+        self.n_trainable = int(sum(p.numel() for p in self.parameters() if p.requires_grad))
+        self.n_total     = int(sum(p.numel() for p in self.parameters()))
 
     # ── Backbone loaders ─────────────────────────────────────────────────
 
@@ -231,13 +256,13 @@ class CLModel(nn.Module):
         feat_dim  = ckpt.get("feat_dim",  2048)
 
         if uses_qefs:
-            # GNAS backbone = QEFSFeatureExtractor with GNAS QuantumInspiredLayer
-            # (ent_fc + BN + ReLU — NOT the theta_x/y/z version from 04_qefs.py)
+            # GNAS backbone = CNN + full 04_qefs QuantumInspiredLayer (+ HFSEA mask)
             raw_dim  = _gnas_get_backbone_dim(backbone_name)
             base     = get_model(backbone_name).to(DEVICE)
             base_ext = get_feature_extractor(base, backbone_name).to(DEVICE)
-            q_layer  = _GNASQuantumLayer(raw_dim, feat_dim).to(DEVICE)
-            extractor = _GNASQEFSExtractor(base_ext, q_layer).to(DEVICE)
+            q_layer  = _GNASQuantumLayer(raw_dim, int(ckpt.get("q_dim", QEFS_FEATURE_DIM))).to(DEVICE)
+            extractor = _GNASQEFSExtractor(base_ext, q_layer, ckpt.get("sel_idx")).to(DEVICE)
+            feat_dim  = extractor.out_dim
         else:
             # GNAS backbone = plain CNN feature extractor
             base      = get_model(backbone_name).to(DEVICE)
@@ -330,6 +355,14 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.data)
+
+
+def _step(model, opt, scaler):
+    """Optimizer step with optional gradient clipping on the TRUE (unscaled) gradients."""
+    if CL_GRAD_CLIP > 0:
+        scaler.unscale_(opt)   # revision fix: clip the TRUE gradients, not the AMP-scaled ones
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CL_GRAD_CLIP)
+    scaler.step(opt); scaler.update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -457,7 +490,14 @@ class DERpp:
             loss_ce = F.cross_entropy(logits, labels)
 
             loss = loss_ce
-            if len(self.buffer) > 0:
+            if len(self.buffer) > 0 and CL_REF_MODE:
+                # Reference DER++ (Buzzega et al.): two INDEPENDENT buffer batches
+                d_imgs, _, d_logits = self.buffer.sample(BATCH_SIZE)
+                c_imgs, c_labels, _ = self.buffer.sample(BATCH_SIZE)
+                loss_dark = F.mse_loss(model(d_imgs).float(), d_logits.float())
+                loss_buf  = F.cross_entropy(model(c_imgs).float(), c_labels)
+                loss = loss_ce + self.alpha * loss_dark + self.beta * loss_buf
+            elif len(self.buffer) > 0:
                 b_imgs, b_labels, b_logits = self.buffer.sample(BATCH_SIZE)
                 b_out = model(b_imgs)
                 # Logit distillation (dark knowledge)
@@ -467,12 +507,14 @@ class DERpp:
                 loss = loss_ce + self.alpha * loss_dark + self.beta * loss_buf
 
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt); scaler.update()
+        _step(model, opt, scaler)
 
         # Store current batch in buffer WITH logits (no grad)
-        with torch.no_grad():
-            lg = model(imgs).detach()
+        if CL_REF_MODE:
+            lg = logits.detach().float()        # pre-update logits from the training forward (reference)
+        else:
+            with torch.no_grad():
+                lg = model(imgs).detach()
         self.buffer.add(imgs.cpu(), labels.cpu(), lg.cpu())
         return loss.item()
 
@@ -525,8 +567,7 @@ class XDER:
                        self.gamma * loss_sem
 
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt); scaler.update()
+        _step(model, opt, scaler)
 
         with torch.no_grad():
             lg = model(imgs).detach()
@@ -544,6 +585,23 @@ class AGEM:
     """
     def __init__(self, buffer_size=BUFFER_SIZE):
         self.buffer = ReplayBuffer(buffer_size)
+        # Revision fix (R4): original A-GEM (Chaudhry et al., 2019) constrains
+        # updates only against memory from PREVIOUS tasks. The submitted version
+        # added current-task samples to the reference buffer immediately. Now the
+        # current task fills a staging reservoir that is committed at task end.
+        # KRISHAK_AGEM_LEGACY=1 restores the submitted behaviour.
+        self.legacy = _AGEM_LEGACY
+        self._per_task = max(1, buffer_size // N_TASKS)
+        self._cur = ReplayBuffer(self._per_task)
+
+    def end_task(self):
+        if self.legacy:
+            return
+        for item in self._cur.data:
+            if len(self.buffer.data) < self.buffer.capacity:
+                self.buffer.data.append(item)
+        self.buffer.n_seen = len(self.buffer.data)
+        self._cur = ReplayBuffer(self._per_task)
 
     def _project_grad(self, model, ref_grad: torch.Tensor) -> None:
         """Project current gradients so they don't increase buffer loss."""
@@ -586,7 +644,7 @@ class AGEM:
             self._project_grad(model, ref_grad)
 
         scaler.step(opt); scaler.update()
-        self.buffer.add(imgs.cpu(), labels.cpu())
+        (self.buffer if self.legacy else self._cur).add(imgs.cpu(), labels.cpu())
         return loss.item()
 
 
@@ -628,11 +686,44 @@ class ERACE:
                 loss  += F.cross_entropy(b_out, b_labels)
 
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt); scaler.update()
+        _step(model, opt, scaler)
 
         self.buffer.add(imgs.cpu(), labels.cpu())
         return loss.item()
+
+
+def buffer_report(method_obj, n_train_total: int) -> dict:
+    """Replay-memory accounting (R1, R5 #5)."""
+    if isinstance(method_obj, GDumb):
+        items = [(img, c) for c, lst in method_obj.buffer.items() for img, _ in lst]
+        cap = method_obj.max_per_class * NUM_CLASSES
+    elif hasattr(method_obj, "buffer") and hasattr(method_obj.buffer, "data"):
+        items = [(it[0], it[1]) for it in method_obj.buffer.data]
+        cap = method_obj.buffer.capacity
+    else:
+        return {}
+    per_class = {CLASS_NAMES[c]: 0 for c in range(NUM_CLASSES)}
+    nbytes = 0
+    for img, c in items:
+        per_class[CLASS_NAMES[int(c)]] += 1
+        nbytes += img.element_size() * img.numel()
+    if hasattr(method_obj, "buffer") and hasattr(method_obj.buffer, "data"):
+        nbytes += sum(it[2].element_size() * it[2].numel()
+                      for it in method_obj.buffer.data if len(it) > 2 and it[2] is not None)
+    counts = [v for v in per_class.values() if v > 0]
+    return {
+        "capacity": int(cap),
+        "stored": int(len(items)),
+        "per_class": per_class,
+        "class_balanced": bool(counts) and (max(counts) - min(counts) <= 1),
+        "fraction_of_train": float(len(items) / max(1, n_train_total)),
+        "memory_MB": float(nbytes / 1e6),
+        "stores": "raw normalised image tensors (3x224x224 float32)"
+                  + (" + logits" if isinstance(method_obj, (DERpp, XDER)) else ""),
+        "policy": ("class-balanced per-class quota" if isinstance(method_obj, GDumb)
+                   else "per-task quota committed at task end" if isinstance(method_obj, AGEM) and not method_obj.legacy
+                   else "reservoir sampling over the stream"),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -655,6 +746,12 @@ def cl_train_loop(method_name: str, method_obj, model: nn.Module,
 
     acc_matrix  = np.zeros((N_TASKS, N_TASKS))
     loss_curves = []  # per task
+    # FWT reference b_j: accuracy on task j of the model before any CL training
+    # (backbone loaded, head freshly initialised). With a shared 10-way head and
+    # unseen classes, acc[j-1, j] and b_j are both ~0, so FWT is ~0 by construction
+    # in this class-incremental protocol (R1) — reported, but not interpreted.
+    model.eval()
+    fwt_ref = [float(task_accuracy(model, task_loaders_test[t])) for t in range(N_TASKS)]
     t_total     = time.time()
 
     for task_id in range(N_TASKS):
@@ -702,6 +799,8 @@ def cl_train_loop(method_name: str, method_obj, model: nn.Module,
                     print(f"    Epoch {epoch+1}/{EPOCHS_PER_TASK} | loss={avg_loss:.4f} | lr={cur_lr:.2e}")
 
         loss_curves.append(task_losses)
+        if hasattr(method_obj, "end_task"):
+            method_obj.end_task()
 
         # Evaluate on ALL tasks seen so far
         model.eval()
@@ -752,6 +851,18 @@ def cl_train_loop(method_name: str, method_obj, model: nn.Module,
         "total_training_time_s": total_time,
         "inference_time_per_img_s": float(inf_time),
         "buffer_size":        BUFFER_SIZE,
+        "fwt_reference_acc":  fwt_ref,
+        "FWT_vs_init":        float(np.mean([acc_matrix[j-1, j] - fwt_ref[j] for j in range(1, N_TASKS)])),
+        "task_order":         TASKS,
+        "task_order_seed":    CL_TASK_ORDER,
+        "seed":               SEED,
+        "freeze_mode":        CL_FREEZE_MODE,
+        "grad_clip":          CL_GRAD_CLIP,
+        "der_ref_mode":       CL_REF_MODE,
+        "agem_legacy":        _AGEM_LEGACY,
+        "n_trainable_params": getattr(model, "n_trainable", None),
+        "n_total_params":     getattr(model, "n_total", None),
+        "memory_report":      buffer_report(method_obj, len(train_df)),
         "n_tasks":            N_TASKS,
         "epochs_per_task":    EPOCHS_PER_TASK,
         "preds":              preds.tolist(),
@@ -759,12 +870,14 @@ def cl_train_loop(method_name: str, method_obj, model: nn.Module,
     }
     results.update(compute_full_metrics(preds, labels, method_name))
     _safe_method = method_name.lower().replace("-", "_").replace("+", "p")
-    _save_key = f"cl_{model_name}_{_safe_method}" if model_name else f"cl_{_safe_method}"
+    _save_key = (f"cl_{model_name}_{_safe_method}" if model_name else f"cl_{_safe_method}") + CL_VARIANT
     save_results(results, _save_key)
 
-    # Save model checkpoint for this method + backbone
+    # Save model checkpoint for this method + backbone (main setting only)
     _ckpt_name = f"cl_{model_name}_{_safe_method}_best.pth" if model_name else f"cl_{_safe_method}_best.pth"
     _ckpt_path = os.path.join(MODELS_DIR, _ckpt_name)
+    if CL_VARIANT:
+        return results
     torch.save({
         "model_state":    model.state_dict(),
         "method":         method_name,
@@ -990,6 +1103,12 @@ if __name__ == "__main__":
         "A-GEM":  (AGEM,   {}),
         "ER-ACE": (ERACE,  {}),
     }
+    # KRISHAK_CL_METHODS=A-GEM,ER-ACE runs a subset
+    if os.environ.get("KRISHAK_CL_METHODS"):
+        _keep = [m.strip() for m in __import__("re").split(r"[,:]", os.environ["KRISHAK_CL_METHODS"]) if m.strip()]   # "," or ":" (":" is safe inside sbatch --export)
+        methods = {k: v for k, v in methods.items() if k in _keep}
+    print(f"  Variant: '{CL_VARIANT or 'main'}'  buffer={BUFFER_SIZE}  freeze={CL_FREEZE_MODE}  "
+          f"order={CL_TASK_ORDER}  seed={SEED}  methods={list(methods)}")
 
     # ── Model order: best → worst by GNAS test accuracy ───────────────────
     import json as _json
@@ -1005,8 +1124,8 @@ if __name__ == "__main__":
     ]
     # Only include models whose GNAS checkpoint exists
     _ranked_models = sorted(
-        [m for m in _all_models
-         if os.path.exists(os.path.join(MODELS_DIR, f"gnas_{m}_best.pth"))],
+        [m for m in _all_models if m in MODEL_NAMES
+         and os.path.exists(os.path.join(MODELS_DIR, f"gnas_{m}_best.pth"))],
         key=_gnas_acc, reverse=True
     )
     print(f"\n  Model order (best → worst by GNAS accuracy):")
@@ -1024,7 +1143,7 @@ if __name__ == "__main__":
         model_results = []
         for method_name, (MethodClass, kwargs) in methods.items():
             safe_name = method_name.lower().replace("-", "_").replace("+", "p")
-            res_key   = f"cl_{model_name}_{safe_name}"
+            res_key   = f"cl_{model_name}_{safe_name}" + CL_VARIANT
             res_path  = os.path.join(RESULTS_DIR, f"{res_key}.json")
 
             if os.path.exists(res_path):
@@ -1048,7 +1167,8 @@ if __name__ == "__main__":
             del model; torch.cuda.empty_cache()
 
         all_model_results[model_name] = model_results
-        plot_cl_comparison(model_results, model_name=model_name)
+        if not CL_VARIANT:
+            plot_cl_comparison(model_results, model_name=model_name)
 
         print("\n" + "=" * 75)
         print(f"  {model_name} — CL Summary")
@@ -1069,7 +1189,7 @@ if __name__ == "__main__":
         for r in results:
             if best_r is None or r.get("AA", 0) > best_r.get("AA", 0):
                 best_r, best_mn = r, mn
-    if best_r is not None:
+    if best_r is not None and not CL_VARIANT:
         _best_safe = best_r["method"].lower().replace("-", "_").replace("+", "p")
         _src = os.path.join(MODELS_DIR, f"cl_{best_mn}_{_best_safe}_best.pth")
         _dst = os.path.join(MODELS_DIR, "cl_overall_best.pth")
@@ -1080,10 +1200,15 @@ if __name__ == "__main__":
                   f"(AA={best_r['AA']:.4f}) → cl_overall_best.pth")
 
     # ── Cross-model summary plot ──────────────────────────────────────────
-    plot_cl_cross_model_summary(all_model_results)
+    if not CL_VARIANT:
+        plot_cl_cross_model_summary(all_model_results)
 
     # ── Final cross-model table ───────────────────────────────────────────
     print("\n" + "=" * 90)
     print(f"  {'Model':<28} {'Method':<12} {'AA':>8} {'BWT':>8} {'TestAcc':>10} {'F1':>8}")
     print("  " + "-" * 85)
- 
+    for mn, results in all_model_results.items():
+        for r in results:
+            print(f"  {mn:<28} {r['method']:<12} {r.get('AA', 0):>8.4f} {r.get('BWT', 0):>8.4f} "
+                  f"{r.get('final_test_acc', 0):>10.4f} {r.get('final_f1_macro', 0):>8.4f}")
+    print("=" * 90)

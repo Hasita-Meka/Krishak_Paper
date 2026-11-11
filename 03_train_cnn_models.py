@@ -308,20 +308,11 @@ def run_cross_validation(model_name: str, df: pd.DataFrame, dirs: list) -> dict:
     except ImportError:
         from torch.cuda.amp import GradScaler
 
-    print(f"\n  [CV] {model_name} — {CV_FOLDS}-fold cross-validation …")
-    # Use only original images for CV to avoid data leakage
-    orig_df = df[df.get("is_augmented", pd.Series([False]*len(df))) != True].reset_index(drop=True)
-    if len(orig_df) == 0:
-        orig_df = df
-
-    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
-    labels = orig_df["label"].values
+    print(f"\n  [CV] {model_name} — {CV_FOLDS}-fold leakage-safe CV, {CV_FOLD_EPOCHS} epochs/fold …")
+    from utils import leakfree_cv_folds
     fold_accs, fold_f1s = [], []
 
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(orig_df, labels), 1):
-        tr_df = orig_df.iloc[tr_idx]
-        va_df = orig_df.iloc[va_idx]
-
+    for fold, tr_df, va_df in leakfree_cv_folds(df, CV_FOLDS):
         tr_ds = MultiDirDataset(tr_df, dirs, get_train_transform())
         va_ds = MultiDirDataset(va_df, dirs, get_val_transform())
         tr_ld = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -336,8 +327,11 @@ def run_cross_validation(model_name: str, df: pd.DataFrame, dirs: list) -> dict:
                                       weight_decay=WEIGHT_DECAY)
         scaler    = GradScaler(device="cuda", enabled=USE_AMP)
 
+        # Same cosine schedule as the final models, stretched to the CV budget
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CV_FOLD_EPOCHS, eta_min=ETA_MIN)
         for ep in range(CV_FOLD_EPOCHS):
             train_one_epoch(model, tr_ld, optimizer, criterion, scaler)
+            sched.step()
 
         from sklearn.metrics import f1_score as sk_f1
         _, acc, p, l = evaluate(model, va_ld, criterion)
@@ -353,6 +347,8 @@ def run_cross_validation(model_name: str, df: pd.DataFrame, dirs: list) -> dict:
         "cv_f1_std":   float(np.std(fold_f1s)),
         "cv_fold_accs": [float(x) for x in fold_accs],
         "cv_fold_f1s":  [float(x) for x in fold_f1s],
+        "cv_epochs":    CV_FOLD_EPOCHS,
+        "cv_protocol":  "leakage-safe: folds over original photos, train-fold augmentation only",
     }
     print(f"  [CV] {model_name}: acc={cv_results['cv_acc_mean']:.4f}±{cv_results['cv_acc_std']:.4f}")
     return cv_results
@@ -508,8 +504,16 @@ if __name__ == "__main__":
         existing = load_results(save_tag)
         if existing and os.path.exists(os.path.join(MODELS_DIR, f"{save_tag}_best.pth")):
             print(f"\n  [Skip] {model_name} already trained. Loading results.")
+            # CV-budget sensitivity (R5 #2): KRISHAK_CV_ONLY=1 reruns only CV at
+            # KRISHAK_CV_EPOCHS and stores it under cv_e<epochs> without touching the model.
+            if os.environ.get("KRISHAK_CV_ONLY") == "1":
+                all_df = pd.concat([train_df, val_df, test_df])
+                existing[f"cv_e{CV_FOLD_EPOCHS}"] = run_cross_validation(model_name, all_df, dirs)
+                save_results(existing, save_tag)
+                all_results.append(existing)
+                continue
             # Re-run CV if not present
-            if "cv_acc_mean" not in existing:
+            if "cv_acc_mean" not in existing and not SKIP_CV:
                 all_df = pd.concat([train_df, val_df, test_df])
                 cv_r = run_cross_validation(model_name, all_df, dirs)
                 existing.update(cv_r)
@@ -522,10 +526,12 @@ if __name__ == "__main__":
             num_epochs=NUM_EPOCHS, lr=LEARNING_RATE
         )
 
-        # Cross-validation
-        all_df = pd.concat([train_df, val_df, test_df])
-        cv_r = run_cross_validation(model_name, all_df, dirs)
-        results.update(cv_r)
+        # Cross-validation (skipped in nested / multi-seed runs: KRISHAK_SKIP_CV=1)
+        if not SKIP_CV:
+            all_df = pd.concat([train_df, val_df, test_df])
+            cv_r = run_cross_validation(model_name, all_df, dirs)
+            results.update(cv_r)
+        results.update({"seed": SEED, "outer_fold": OUTER_FOLD, "run_tag": RUN_TAG})
         save_results(results, model_name)
 
         all_results.append(results)
@@ -537,3 +543,10 @@ if __name__ == "__main__":
     # ── Print summary table ────────────────────────────────────────────────
     print("\n" + "=" * 80)
     print(f"  {'Model':<25} {'Train':>8} {'Val':>8} {'Test':>8} {'F1-Macro':>10} {'CV-Acc':>10}")
+    print("  " + "-" * 75)
+    for r in all_results:
+        cv = r.get("cv_acc_mean")
+        print(f"  {r.get('model_name', '?'):<25} {r.get('train_acc', 0):>8.4f} {r.get('val_acc', 0):>8.4f} "
+              f"{r.get('test_acc', 0):>8.4f} {r.get('f1_macro', r.get('test_f1_macro', 0)) or 0:>10.4f} "
+              f"{(f'{cv:.4f}') if cv is not None else 'n/a':>10}")
+    print("=" * 80)

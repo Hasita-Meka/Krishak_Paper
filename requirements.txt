@@ -28,3 +28,7 @@ tqdm>=4.66.0
 
 # ── Optional: image hashing for cleaning ─────────────────────────────────
 imagehash>=4.3.1
+
+# ── Revision scripts ─────────────────────────────────────────────────────
+joblib>=1.3.0          # parallel HFSEA fitness evaluation
+lime>=0.2.0.1          # optional, used by 08 if installed

@@ -914,7 +914,7 @@ def plot_occlusion_sensitivity(model: nn.Module, model_name: str,
 # ════════════════════════════════════════════════════════════════════════════
 def plot_shap_suite(model: nn.Module, model_name: str,
                     dataset: PlantDiseaseDataset, save_dir=XAI_DIR):
-    if not SHAP_AVAILABLE:
+    if not SHAP_AVAILABLE or SMOKE:
         return
     print(f"  [SHAP] computing for {model_name} …")
     model.eval()
@@ -1078,7 +1078,7 @@ def plot_shap_suite(model: nn.Module, model_name: str,
 def plot_lime(model: nn.Module, model_name: str,
               dataset: PlantDiseaseDataset, save_dir=XAI_DIR,
               n_samples: int = 3):
-    if not LIME_AVAILABLE:
+    if not LIME_AVAILABLE or SMOKE:
         return
     print(f"  [LIME] computing for {model_name} …")
     model.eval()
@@ -1149,7 +1149,7 @@ def plot_tsne_umap(model: nn.Module, model_name: str, save_dir=XAI_DIR):
     f_sub   = feats[idx]; l_sub = labels[idx]
     import sklearn
     _tsne_iter_kwarg = "max_iter" if tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 5) else "n_iter"
-    tsne    = TSNE(n_components=2, perplexity=30, **{_tsne_iter_kwarg: 1000},
+    tsne    = TSNE(n_components=2, perplexity=min(30, len(f_sub) - 1), **{_tsne_iter_kwarg: 1000},
                    random_state=SEED, n_jobs=-1)
     emb     = tsne.fit_transform(f_sub)
 

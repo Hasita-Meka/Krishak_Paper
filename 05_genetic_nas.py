@@ -128,23 +128,34 @@ _cnn_feat_dims: Dict[str, int] = {
 # QEFS Building Blocks
 # (mirrored here so this script is self-contained; also used by 04_qefs.py)
 # ════════════════════════════════════════════════════════════════════════════
-class QuantumInspiredLayer(nn.Module):
-    """
-    Quantum-Inspired transformation layer.
-    Maps raw CNN features → compressed QEFS feature space via
-    a learned entanglement projection (Linear → BN → ReLU).
+# ── Revision fix ────────────────────────────────────────────────────────────
+# The submitted version defined its own QuantumInspiredLayer here
+# (Linear → BN → ReLU) and loaded QEFS checkpoints with strict=False, which
+# silently DROPPED the rotation (theta_x/y/z), Hadamard (H) and amplitude-
+# normalisation parts of the QIL trained in 04_qefs.py. GNAS now reuses the exact
+# 04_qefs.py layer and loads it strictly, and (by default) consumes only the
+# HFSEA-selected features, as the manuscript describes.
+import importlib.util as _ilu
+_q_spec = _ilu.spec_from_file_location(
+    "qefs_module_for_gnas", os.path.join(os.path.dirname(os.path.abspath(__file__)), "04_qefs.py"))
+_q_mod = _ilu.module_from_spec(_q_spec); _q_spec.loader.exec_module(_q_mod)
+QuantumInspiredLayer = _q_mod.QuantumInspiredLayer
 
-    Checkpoint key prefix: q_layer
-    Sub-keys: ent_fc, bn, act
-    """
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.ent_fc = nn.Linear(in_dim, out_dim)
-        self.bn     = nn.BatchNorm1d(out_dim)
-        self.act    = nn.ReLU(inplace=True)
+GNAS_USE_MASK     = os.environ.get("KRISHAK_GNAS_USE_MASK", "1") == "1"   # HFSEA-selected features
+GNAS_FINETUNE_BB  = os.environ.get("KRISHAK_GNAS_FINETUNE", "0") == "1"   # 0 = frozen backbone (paper)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.ent_fc(x)))
+
+def load_selected_idx(model_name: str) -> Optional[List[int]]:
+    """HFSEA-selected feature indices saved by 04_qefs.py (None → use all)."""
+    p = os.path.join(RESULTS_DIR, f"qefs_{model_name}.json")
+    if GNAS_USE_MASK and os.path.exists(p):
+        with open(p) as f:
+            idx = json.load(f).get("selected_feature_idx")
+        if idx:
+            return [int(i) for i in idx]
+    if GNAS_USE_MASK:
+        print(f"    [GNAS][WARN] no HFSEA mask for {model_name}; using all QIL features.")
+    return None
 
 
 class QCNNHead(nn.Module):
@@ -183,16 +194,24 @@ class QEFSFeatureExtractor(nn.Module):
       backbone.backbone.*  → CNN feature extractor
       backbone.q_layer.*   → QuantumInspiredLayer
     """
-    def __init__(self, backbone: nn.Module, q_layer: QuantumInspiredLayer):
+    def __init__(self, backbone: nn.Module, q_layer: QuantumInspiredLayer,
+                 sel_idx: Optional[List[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.q_layer  = q_layer
+        self.register_buffer("sel_idx", torch.as_tensor(sel_idx, dtype=torch.long)
+                             if sel_idx is not None else None)
+
+    @property
+    def out_dim(self) -> int:
+        return int(self.sel_idx.numel()) if self.sel_idx is not None else int(self.q_layer.bn.num_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         f = self.backbone(x)
         if isinstance(f, (tuple, list)):
             f = f[0]
-        return self.q_layer(f)
+        q = self.q_layer(f)
+        return q.index_select(1, self.sel_idx) if self.sel_idx is not None else q
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -249,10 +268,10 @@ class SearchableHead(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 class GNASModel(nn.Module):
     """backbone (QEFSFeatureExtractor) + head (SearchableHead)."""
-    def __init__(self, backbone: QEFSFeatureExtractor, arch: Dict):
+    def __init__(self, backbone: QEFSFeatureExtractor, arch: Dict, in_dim: Optional[int] = None):
         super().__init__()
         self.backbone = backbone
-        self.head     = SearchableHead(QEFS_FEATURE_DIM, arch)
+        self.head     = SearchableHead(in_dim or QEFS_FEATURE_DIM, arch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.backbone(x))
@@ -268,6 +287,11 @@ _ACTIVATIONS = ["relu", "gelu", "silu"]
 _LR_MULTS    = [0.5, 1.0, 2.0]
 CHROM_GENES  = [len(_N_LAYERS), len(_HIDDEN_DIMS), len(_DROPOUTS),
                 len(_ACTIVATIONS), 2, 2, len(_LR_MULTS)]  # 2 = boolean
+
+
+_N_EVALS = 0          # candidate evaluations performed (search-cost report, R1 / R5 #14)
+SEARCH_MODE = os.environ.get("KRISHAK_GNAS_SEARCH", "ga")   # "ga" | "random" (R1: random-search control)
+RESULT_TAG  = "gnas" if SEARCH_MODE == "ga" else "gnasrand"
 
 
 def random_chromosome() -> List[int]:
@@ -333,6 +357,7 @@ def build_model_with_arch(
         base_ext  = get_feature_extractor(base_full, model_name).to(DEVICE)
         q_layer   = QuantumInspiredLayer(raw_dim, q_dim).to(DEVICE)
         extractor = QEFSFeatureExtractor(base_ext, q_layer).to(DEVICE)
+        sel_idx   = load_selected_idx(model_name)
 
         state    = ckpt["model_state"]
         # Strategy 1: Use QCNNHead as a proxy for structured loading (backbone.* / q_layer.*)
@@ -340,7 +365,7 @@ def build_model_with_arch(
             _proxy = QCNNHead(get_feature_extractor(
                 get_model(model_name, pretrained=False).to(DEVICE), model_name
             ).to(DEVICE), raw_dim, q_dim).to(DEVICE)
-            _proxy.load_state_dict(state, strict=False)
+            _proxy.load_state_dict(state, strict=True)   # was strict=False (dropped QIL params)
             extractor.backbone.load_state_dict(
                 _proxy.backbone.state_dict(), strict=True)
             extractor.q_layer.load_state_dict(
@@ -387,10 +412,29 @@ def build_model_with_arch(
         uses_qefs = False
         q_dim     = QEFS_FEATURE_DIM
 
-    model = GNASModel(extractor, arch).to(DEVICE)
+    if uses_qefs and sel_idx is not None:
+        extractor.register_buffer("sel_idx", torch.as_tensor(sel_idx, dtype=torch.long, device=DEVICE))
+    model = GNASModel(extractor, arch, in_dim=extractor.out_dim).to(DEVICE)
     model._uses_qefs = uses_qefs
     model._feat_dim  = q_dim
+    model._sel_idx   = sel_idx if uses_qefs else None
     return model
+
+
+def load_gnas_model(model_name: str, tag: str = "gnas") -> Optional[nn.Module]:
+    """Rebuild a trained GNAS model from MODELS_DIR (used by 06/08/14-16)."""
+    path = os.path.join(MODELS_DIR, f"{tag}_{model_name}_best.pth")
+    if not os.path.exists(path):
+        return None
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    raw_dim = _cnn_feat_dims[model_name]
+    q_dim   = int(ckpt.get("q_dim", QEFS_FEATURE_DIM))
+    base_ext = get_feature_extractor(get_model(model_name, pretrained=False).to(DEVICE), model_name)
+    extractor = QEFSFeatureExtractor(base_ext, QuantumInspiredLayer(raw_dim, q_dim), ckpt.get("sel_idx")).to(DEVICE)
+    model = GNASModel(extractor, ckpt["arch"], in_dim=extractor.out_dim).to(DEVICE)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model._sel_idx = ckpt.get("sel_idx")
+    return model.eval()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -457,6 +501,8 @@ def _quick_eval(
     freeze_backbone: bool = True,
 ) -> float:
     """Train a candidate for n_epochs; return best val accuracy."""
+    global _N_EVALS
+    _N_EVALS += 1
     model = build_model_with_arch(model_name, arch,
                                   pretrained_path=baseline_path,
                                   qefs_path=qefs_path)
@@ -552,6 +598,34 @@ def run_genetic_search(
     return best_arch, gen_best
 
 
+def run_random_search(
+    model_name:     str,
+    train_loader:   DataLoader,
+    val_loader:     DataLoader,
+    qefs_path:      Optional[str],
+    baseline_path:  Optional[str],
+    pop_size:       int = GNAS_POP_SIZE,
+    n_generations:  int = GNAS_GENERATIONS,
+) -> Tuple[Dict, List[float]]:
+    """Random-search control (R1): the same number of candidate evaluations as
+    the GA (pop_size x n_generations), each an independent random architecture.
+    gen_best[g] = best fitness after (g+1) x pop_size evaluations, so its curve is
+    directly comparable to the GA convergence curve."""
+    budget = pop_size * n_generations
+    print(f"\n  ── Random Search for {model_name} (budget={budget} evaluations) ──")
+    best_arch, best_fitness, gen_best = None, 0.0, []
+    for k in range(budget):
+        arch = decode_chromosome(random_chromosome())
+        fit  = _quick_eval(model_name, arch, train_loader, val_loader,
+                           qefs_path, baseline_path, n_epochs=GNAS_EVAL_EPOCHS)
+        if fit > best_fitness:
+            best_fitness, best_arch = fit, arch
+        print(f"    RS {k+1:03d}/{budget}  fit={fit:.4f}  best={best_fitness:.4f}  arch={arch}")
+        if (k + 1) % pop_size == 0:
+            gen_best.append(best_fitness)
+    return best_arch, gen_best
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Full fine-tune of winner architecture
 # ════════════════════════════════════════════════════════════════════════════
@@ -588,22 +662,27 @@ def full_finetune(
                                    label_smoothing=LABEL_SMOOTHING)
     scaler  = GradScaler(device="cuda", enabled=USE_AMP)
 
-    print("  Stage 1: warm-up head (10 epochs, backbone frozen) …")
-    for ep in range(10):
+    _warm = 1 if SMOKE else 10
+    print(f"  Stage 1: warm-up head ({_warm} epochs, backbone frozen) …")
+    for ep in range(_warm):
         tl, ta = train_one_epoch(model, train_loader, opt1, crit, scaler)
         vl, va, _, _ = evaluate(model, val_loader, crit)
         sched1.step()
         print(f"    Ep {ep+1:02d}/10  train_loss={tl:.4f} train_acc={ta:.4f}  "
               f"val_loss={vl:.4f} val_acc={va:.4f}")
 
-    # Stage 2: unfreeze and full fine-tune
-    for p in model.backbone.parameters():
-        p.requires_grad_(True)
-
-    all_params = [
-        {"params": model.backbone.parameters(), "lr": lr * 0.1},
-        {"params": model.head.parameters(),     "lr": lr},
-    ]
+    # Stage 2: the submitted version always unfroze the backbone here, although
+    # the paper describes a head trained on a frozen QEFS backbone. Default now
+    # keeps it frozen (paper setting); KRISHAK_GNAS_FINETUNE=1 restores fine-tuning.
+    if GNAS_FINETUNE_BB:
+        for p in model.backbone.parameters():
+            p.requires_grad_(True)
+        all_params = [
+            {"params": model.backbone.parameters(), "lr": lr * 0.1},
+            {"params": model.head.parameters(),     "lr": lr},
+        ]
+    else:
+        all_params = [{"params": model.head.parameters(), "lr": lr}]
     opt2   = torch.optim.AdamW(all_params, weight_decay=WEIGHT_DECAY)
     sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=NUM_EPOCHS,
                                                          eta_min=ETA_MIN)
@@ -614,7 +693,8 @@ def full_finetune(
     best_val_acc = 0.0
     best_state   = None
 
-    print(f"  Stage 2: full fine-tune ({NUM_EPOCHS} epochs, early stop p={PATIENCE}) …")
+    print(f"  Stage 2: {'backbone+head fine-tune' if GNAS_FINETUNE_BB else 'head only (backbone frozen)'} "
+          f"({NUM_EPOCHS} epochs, early stop p={PATIENCE}) …")
     t_train_start = time.time()
 
     for ep in range(NUM_EPOCHS):
@@ -715,9 +795,8 @@ def cross_validate(
     y_all = df["label"].values
     fold_accs, fold_f1s = [], []
 
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(df, y_all)):
-        tr_df = df.iloc[tr_idx].reset_index(drop=True)
-        va_df = df.iloc[va_idx].reset_index(drop=True)
+    from utils import leakfree_cv_folds
+    for fold, tr_df, va_df in ((f - 1, a, b) for f, a, b in leakfree_cv_folds(df, n_folds)):
         tr_ld = DataLoader(
             MultiDirDataset(tr_df, dirs, get_train_transform()),
             batch_size=BATCH_SIZE, shuffle=True,
@@ -944,14 +1023,17 @@ def run_shap(
     n_test:   int = SHAP_TEST_SAMPLES,
 ):
     """SHAP DeepExplainer — must NOT use @torch.no_grad() as SHAP needs grads."""
+    if SMOKE:
+        print("  [SHAP] skipped in smoke mode"); return
     try:
         import shap
     except ImportError:
         print("  [SHAP] shap not installed — skipping.")
         return
 
-    # Enable gradients for all parameters (DeepExplainer requires grad_fn)
-    model.train()  # train mode ensures BN/dropout behave + grads flow
+    # Revision fix: SHAP must explain the deployed (eval-mode) model; the
+    # submitted version ran it in train mode, changing BN/dropout behaviour.
+    model.eval()
     for p in model.parameters():
         p.requires_grad_(True)
 
@@ -1084,11 +1166,28 @@ def train_one_model(model_name: str, df: pd.DataFrame, dirs: List[str]):
     else:
         print(f"  [OK] QEFS checkpoint found: {os.path.basename(qefs_path)}")
 
-    # ── 1. Genetic Architecture Search ────────────────────────────────────
-    best_arch, gen_best = run_genetic_search(
+    # ── 1. Architecture search (GA, or random-search control) ─────────────
+    global _N_EVALS
+    _N_EVALS = 0
+    _search_fn = run_genetic_search if SEARCH_MODE == "ga" else run_random_search
+    _t_search = time.time()
+    best_arch, gen_best = _search_fn(
         model_name, ga_tr_ld, ga_va_ld, qefs_path, baseline_path,
         pop_size=GNAS_POP_SIZE, n_generations=GNAS_GENERATIONS,
     )
+    search_stats = {
+        "backbone_finetuned":   GNAS_FINETUNE_BB,
+        "uses_hfsea_mask":      GNAS_USE_MASK,
+        "search_mode":          SEARCH_MODE,
+        "search_time_s":        time.time() - _t_search,
+        "search_candidate_evals": _N_EVALS,
+        "search_space_size":    int(np.prod(CHROM_GENES)),
+        "search_train_subset":  len(ga_train_df),
+        "search_val_subset":    len(ga_val_df),
+        "seed":                 SEED,
+        "outer_fold":           OUTER_FOLD,
+        "run_tag":              RUN_TAG,
+    }
     print(f"\n  ▶ Best arch found: {best_arch}")
 
     # ── 2. Full fine-tune ──────────────────────────────────────────────────
@@ -1100,14 +1199,17 @@ def train_one_model(model_name: str, df: pd.DataFrame, dirs: List[str]):
     total_time = time.time() - t_total_start
 
     # ── 3. Save checkpoint ─────────────────────────────────────────────────
-    ckpt_path = os.path.join(MODELS_DIR, f"gnas_{model_name}_best.pth")
+    ckpt_path = os.path.join(MODELS_DIR, f"{RESULT_TAG}_{model_name}_best.pth")
     torch.save({
         "model_state": model.state_dict(),
         "arch":        best_arch,
         "model_name":  model_name,
         "epoch":       len(history["train_acc"]),
         "uses_qefs":   getattr(model, "_uses_qefs", True),
-        "feat_dim":    QEFS_FEATURE_DIM,
+        "feat_dim":    model.backbone.out_dim,      # dim fed to the head
+        "q_dim":       QEFS_FEATURE_DIM,
+        "sel_idx":     getattr(model, "_sel_idx", None),
+        "backbone_finetuned": GNAS_FINETUNE_BB,
     }, ckpt_path)
     print(f"  Checkpoint saved → {ckpt_path}")
 
@@ -1127,10 +1229,19 @@ def train_one_model(model_name: str, df: pd.DataFrame, dirs: List[str]):
     boot_ci = bootstrap_ci(np.array(y_true_all), np.array(y_pred_all))
 
     # ── 5. Cross-Validation ────────────────────────────────────────────────
-    cv_res = cross_validate(
-        model_name, best_arch, df, dirs, qefs_path, baseline_path,
-        n_folds=CV_FOLDS, n_epochs=CV_FOLD_EPOCHS,
-    )
+    # The old CV here trained heads on a backbone that had already seen most of
+    # each validation fold (R1: optimistic 98-99.5%). Unbiased CV now comes from
+    # the nested runs (KRISHAK_OUTER_FOLD, see RUNBOOK). KRISHAK_GNAS_CV=1 still
+    # runs a head-only CV, leak-free w.r.t. augmentation and excluding the test
+    # set, but it is labelled as optimistic because the backbone is shared.
+    if os.environ.get("KRISHAK_GNAS_CV") == "1" and not SKIP_CV:
+        cv_res = cross_validate(
+            model_name, best_arch, pd.concat([train_df, val_df]), dirs, qefs_path, baseline_path,
+            n_folds=CV_FOLDS, n_epochs=CV_FOLD_EPOCHS,
+        )
+        cv_res["cv_note"] = "head-only CV on train+val; backbone shared across folds (optimistic)"
+    else:
+        cv_res = {"cv_note": "not run; see nested CV summary (12_nested_summary.py)"}
 
     # ── 6. Memory profiling ────────────────────────────────────────────────
     mem = measure_memory(model, te_ld)
@@ -1156,20 +1267,21 @@ def train_one_model(model_name: str, df: pd.DataFrame, dirs: List[str]):
             "cv_folds":       CV_FOLDS,
         },
         **train_m, **val_m, **test_m,
-        **boot_ci, **cv_res, **mem,
+        **boot_ci, **cv_res, **mem, **search_stats,
     }
 
     # Save JSON
-    results_path = os.path.join(RESULTS_DIR, f"gnas_{model_name}.json")
+    results_path = os.path.join(RESULTS_DIR, f"{RESULT_TAG}_{model_name}.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"  Results saved → {results_path}")
 
     # ── 8. Plots ───────────────────────────────────────────────────────────
-    plot_all(model_name, history, {**val_m, **test_m},
-             best_arch, gen_best, PLOTS_DIR)
-    run_shap(model, te_ld, PLOTS_DIR, model_name)
-    run_gradcam(model, te_ld, PLOTS_DIR, model_name)
+    if SEARCH_MODE == "ga":
+        plot_all(model_name, history, {**val_m, **test_m},
+                 best_arch, gen_best, PLOTS_DIR)
+        run_shap(model, te_ld, PLOTS_DIR, model_name)
+        run_gradcam(model, te_ld, PLOTS_DIR, model_name)
 
     # ── 9. Print Summary ───────────────────────────────────────────────────
     print(f"\n  ─ GNAS {model_name} Results ─")
@@ -1179,7 +1291,10 @@ def train_one_model(model_name: str, df: pd.DataFrame, dirs: List[str]):
     print(f"    Test  F1   : {test_m['test_f1_macro']:.4f} (macro)")
     print(f"    Boot CI 95%: [{boot_ci['bootstrap_acc_lo']:.4f}, "
           f"{boot_ci['bootstrap_acc_hi']:.4f}]")
-    print(f"    CV Acc     : {cv_res['cv_mean_acc']:.4f} ± {cv_res['cv_acc_ci95']:.4f}")
+    if "cv_mean_acc" in cv_res:
+        print(f"    CV Acc     : {cv_res['cv_mean_acc']:.4f} ± {cv_res['cv_acc_ci95']:.4f} (head-only)")
+    print(f"    Search     : {search_stats['search_mode']} | {search_stats['search_candidate_evals']} evals | "
+          f"{search_stats['search_time_s']/60:.1f} min")
     print(f"    Inf. time  : {test_m['test_inference_ms_per_sample']:.3f} ms/sample")
     print(f"    Train time : {total_time/60:.1f} min")
     print(f"    Best arch  : {best_arch}")
@@ -1221,6 +1336,7 @@ def main():
     if args.generations is not None: GNAS_GENERATIONS  = args.generations
     if args.eval_epochs is not None: GNAS_EVAL_EPOCHS  = args.eval_epochs
     _model_list = list(MODEL_NAMES)
+    print(f"  Search mode: {SEARCH_MODE}  (results tag: {RESULT_TAG})")
     if args.models is not None:
         invalid = [m for m in args.models if m not in MODEL_NAMES]
         if invalid:
@@ -1258,7 +1374,7 @@ def main():
 
     all_results = {}
     for model_name in _model_list:
-        results_path = os.path.join(RESULTS_DIR, f"gnas_{model_name}.json")
+        results_path = os.path.join(RESULTS_DIR, f"{RESULT_TAG}_{model_name}.json")
 
         # ── Cache check ────────────────────────────────────────────────────
         if os.path.exists(results_path) and not args.force:
@@ -1296,7 +1412,7 @@ def main():
             all_results[model_name] = {
                 "test_accuracy": res["test_accuracy"],
                 "test_f1_macro": res["test_f1_macro"],
-                "cv_mean_acc":   res["cv_mean_acc"],
+                "cv_mean_acc":   res.get("cv_mean_acc"),
                 "best_arch":     res["best_arch"],
             }
         except Exception as e:
@@ -1315,8 +1431,9 @@ def main():
         if "error" in r:
             print(f"  {mn:<25} ERROR: {r['error']}")
         else:
+            _cv = r.get("cv_mean_acc")
             print(f"  {mn:<25} {r['test_accuracy']:>10.4f} "
-               f"{r.get('f1_macro', 0):>10.4f} {r.get('cv_accuracy', 0)*100:>9.2f}%")
+               f"{(r.get('test_f1_macro') or 0):>10.4f} {('%9.2f%%' % (_cv*100)) if _cv else '      n/a'}")
     print("="*70)
     print("  Done. Results saved to outputs/results/")
 

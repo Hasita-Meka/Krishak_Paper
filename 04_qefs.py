@@ -251,7 +251,9 @@ class HFSEA:
                  gamma:     float = QEFS_GAMMA,
                  beta0:     float = QEFS_BETA0,
                  delta:     float = QEFS_DELTA,
-                 min_features: int = 10):
+                 min_features: int = 10,
+                 lam: float = float(os.environ.get("KRISHAK_QEFS_LAMBDA", 0.001))):
+        self.lam          = lam
         self.n_features   = n_features
         self.pop_size     = pop_size
         self.max_iter     = max_iter
@@ -289,7 +291,7 @@ class HFSEA:
         for tr_i, va_i in skf.split(X_s, y_tr):
             clf.fit(X_s[tr_i], y_tr[tr_i])
             accs.append(accuracy_score(y_tr[va_i], clf.predict(X_s[va_i])))
-        return float(np.mean(accs)) - 0.001 * sel.sum() / self.n_features  # penalise size
+        return float(np.mean(accs)) - self.lam * sel.sum() / self.n_features  # size penalty λ (Eq. 4)
 
     def _sigmoid(self, x):
         return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
@@ -317,62 +319,116 @@ class HFSEA:
         random_walk = self.alpha * (np.random.rand(self.n_features) - 0.5)
         return pos + social + random_walk
 
+    # ── parallel workers (identical semantics to the sequential loop) ──────
+    # Firefly: individual i (at fitness rank i_ord) only moves towards brighter
+    # individuals j (rank > i_ord), and those are not updated until later in the
+    # same iteration, so every i can be processed from a snapshot in parallel.
+    # Swallow: every individual moves towards the same fixed best position.
+    def _firefly_task(self, i, i_ord, order, pos, fitness, masks, X, y, seed):
+        np.random.seed(seed)
+        p, f, m, n = pos[i].copy(), fitness[i], masks[i].copy(), 0
+        for j_ord in range(i_ord + 1, self.pop_size):
+            j = order[j_ord]
+            if fitness[j] > f:
+                p = self._firefly_update(i, j, p, pos[j])
+                mi = self._binarise(p)
+                fi = self.evaluate_fitness(mi, X, y); n += 1
+                if fi > f:
+                    f, m = fi, mi
+        return i, p, f, m, n
+
+    def _swallow_task(self, i, pos_i, best_pos, step, X, y, seed):
+        np.random.seed(seed)
+        p  = self._swallow_update(pos_i, best_pos, step)
+        mi = self._binarise(p)
+        return i, p, self.evaluate_fitness(mi, X, y), mi, 1
+
+    def _parallel(self, tasks):
+        n_jobs = int(os.environ.get("KRISHAK_NJOBS", os.environ.get("SLURM_CPUS_PER_TASK", 8)))
+        if n_jobs <= 1:
+            return [t[0](*t[1:]) for t in tasks]
+        from joblib import Parallel, delayed
+        try:
+            from joblib import parallel_config
+            ctx = parallel_config(backend="loky", inner_max_num_threads=1)
+        except Exception:
+            import contextlib; ctx = contextlib.nullcontext()
+        with ctx:
+            return Parallel(n_jobs=n_jobs)(delayed(t[0])(*t[1:]) for t in tasks)
+
     def run(self, X_tr: np.ndarray, y_tr: np.ndarray,
             verbose: bool = True) -> tuple:
         """
         Run HFSEA and return (best_mask, best_fitness, history).
+
+        Encoding (as implemented; Algorithm 1 in the paper must match this):
+          * positions start at {-1,+1} from a random binary mask,
+          * binary transfer is stochastic: feature d kept iff U(0,1) < sigmoid(pos_d),
+          * no clipping of positions; fitness = 3-fold CV acc - 0.001 * |mask|/D.
         """
-        # Continuous positions for update rules
+        self.n_evals = 0
         pos = self.pop.copy().astype(float) * 2 - 1   # map {0,1} → {-1,1}
 
-        # Initial fitness
+        # Keep the exact mask that each fitness value was measured on.
+        # (Before the revision, best_mask was re-sampled from the position after
+        #  evaluation, so the returned mask was not the one that earned best_fit.)
+        masks = np.zeros((self.pop_size, self.n_features))
         for i in range(self.pop_size):
-            self.fitness[i] = self.evaluate_fitness(self._binarise(pos[i]), X_tr, y_tr)
-        best_idx = np.argmax(self.fitness)
-        self.best_mask = self._binarise(pos[best_idx])
+            masks[i] = self._binarise(pos[i])
+        init = self._parallel([(self._init_task, i, masks[i], X_tr, y_tr) for i in range(self.pop_size)])
+        for i, f in init:
+            self.fitness[i] = f
+        self.n_evals += self.pop_size
+        best_idx = int(np.argmax(self.fitness))
+        self.best_mask = masks[best_idx].copy()
         self.best_fit  = self.fitness[best_idx]
         self.history.append(self.best_fit)
+        self.selected_history = [int(self.best_mask.sum())]
+        self.mask_history = [np.where(self.best_mask > 0.5)[0].astype(np.int16)]
 
         step = 1.0   # swallow step size
+        base_seed = int(np.random.randint(0, 2**31 - 1))
 
         for it in range(self.max_iter):
-            # ── Firefly phase: pairwise comparison ────────────────────────
+            # ── Firefly phase ──────────────────────────────────────────────
             order = np.argsort(self.fitness)
-            for i_ord in range(self.pop_size):
-                i = order[i_ord]
-                for j_ord in range(i_ord + 1, self.pop_size):
-                    j = order[j_ord]
-                    if self.fitness[j] > self.fitness[i]:
-                        pos[i] = self._firefly_update(i, j, pos[i], pos[j])
-                        mask_i  = self._binarise(pos[i])
-                        fit_i   = self.evaluate_fitness(mask_i, X_tr, y_tr)
-                        if fit_i > self.fitness[i]:
-                            self.fitness[i] = fit_i
+            snap_pos, snap_fit, snap_masks = pos.copy(), self.fitness.copy(), masks.copy()
+            tasks = [(self._firefly_task, int(order[i_ord]), i_ord, order, snap_pos, snap_fit,
+                      snap_masks, X_tr, y_tr, base_seed + it * 1000 + i_ord)
+                     for i_ord in range(self.pop_size)]
+            for i, p, f, m, n in self._parallel(tasks):
+                pos[i], self.fitness[i], masks[i] = p, f, m
+                self.n_evals += n
 
             # ── Swallow phase: all move towards best ──────────────────────
-            best_idx = np.argmax(self.fitness)
-            best_pos = pos[best_idx]
+            best_idx = int(np.argmax(self.fitness))
+            best_pos = pos[best_idx].copy()
             step    *= self.delta   # decay step
-            for i in range(self.pop_size):
-                if i != best_idx:
-                    pos[i] = self._swallow_update(pos[i], best_pos, step)
-                    mask_i  = self._binarise(pos[i])
-                    fit_i   = self.evaluate_fitness(mask_i, X_tr, y_tr)
-                    self.fitness[i] = fit_i
+            tasks = [(self._swallow_task, i, pos[i], best_pos, step, X_tr, y_tr,
+                      base_seed + it * 1000 + 500 + i)
+                     for i in range(self.pop_size) if i != best_idx]
+            for i, p, f, m, n in self._parallel(tasks):
+                pos[i], self.fitness[i], masks[i] = p, f, m
+                self.n_evals += n
 
             # ── Global best ───────────────────────────────────────────────
-            best_idx = np.argmax(self.fitness)
+            best_idx = int(np.argmax(self.fitness))
             if self.fitness[best_idx] > self.best_fit:
                 self.best_fit  = self.fitness[best_idx]
-                self.best_mask = self._binarise(pos[best_idx])
+                self.best_mask = masks[best_idx].copy()
 
             self.history.append(self.best_fit)
+            self.selected_history.append(int(self.best_mask.sum()))
+            self.mask_history.append(np.where(self.best_mask > 0.5)[0].astype(np.int16))
             if verbose:
                 print(f"    HFSEA iter {it+1:3d}/{self.max_iter}: "
                       f"best_fit={self.best_fit:.4f}  "
-                      f"selected={int(self.best_mask.sum())} features")
+                      f"selected={int(self.best_mask.sum())} features  evals={self.n_evals}", flush=True)
 
         return self.best_mask.astype(bool), self.best_fit, self.history
+
+    def _init_task(self, i, mask, X, y):
+        return i, self.evaluate_fitness(mask, X, y)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -476,6 +532,11 @@ def run_qefs_on_model(model_name: str, train_df: pd.DataFrame,
     X_va, y_va = extract_q(val_ld)
     X_te, y_te = extract_q(test_ld)
 
+    # Cache the quantum features so feature-selection baselines and the λ /
+    # iteration sensitivity runs (10_fs_baselines.py) can reuse them on CPU.
+    np.savez_compressed(os.path.join(RESULTS_DIR, f"qefs_features_{model_name}.npz"),
+                        X_tr=X_tr, y_tr=y_tr, X_va=X_va, y_va=y_va, X_te=X_te, y_te=y_te)
+
     # Combine train + val for HFSEA
     X_all = np.concatenate([X_tr, X_va])
     y_all = np.concatenate([y_tr, y_va])
@@ -492,7 +553,9 @@ def run_qefs_on_model(model_name: str, train_df: pd.DataFrame,
         delta        = QEFS_DELTA,
         min_features = max(10, X_all.shape[1] // 10),
     )
+    _t_search = time.time()
     best_mask, best_fitness, hfsea_history = hfsea.run(X_all, y_all, verbose=True)
+    hfsea_search_s = time.time() - _t_search   # full search wall-clock (R1, R5 #14)
 
     n_selected = int(best_mask.sum())
     print(f"\n  HFSEA selected {n_selected}/{X_all.shape[1]} features  (fitness={best_fitness:.4f})")
@@ -514,6 +577,10 @@ def run_qefs_on_model(model_name: str, train_df: pd.DataFrame,
     )
     clf.fit(X_tr_sel, y_tr)
     train_time = time.time() - t0
+    # Keep the fitted selector + classifier for the end-to-end latency profile
+    import joblib
+    joblib.dump({"scaler": scaler_fs, "clf": clf, "mask": best_mask},
+                os.path.join(MODELS_DIR, f"qefs_mlp_{model_name}.joblib"))
 
     t1 = time.time()
     preds_te = clf.predict(X_te_sel)
@@ -542,6 +609,15 @@ def run_qefs_on_model(model_name: str, train_df: pd.DataFrame,
         "feature_reduction_%": float(100 * (1 - n_selected / X_all.shape[1])),
         "hfsea_best_fitness":  float(best_fitness),
         "hfsea_history":       [float(x) for x in hfsea_history],
+        "hfsea_search_time_s": float(hfsea_search_s),
+        "hfsea_fitness_evals": int(getattr(hfsea, "n_evals", 0)),
+        "hfsea_selected_history": [int(x) for x in getattr(hfsea, "selected_history", [])],
+        "hfsea_lambda":        float(hfsea.lam),
+        "selected_feature_idx": [int(i) for i in np.where(best_mask)[0]],
+        "seed":                SEED,
+        "outer_fold":          OUTER_FOLD,
+        "hfsea_pop_size":      QEFS_POP_SIZE,
+        "hfsea_iterations":    QEFS_MAX_ITER,
         "training_time_s":     float(train_time),
         "inference_time_per_img_s": float(inf_time),
         "preds":               preds_te.tolist(),
@@ -707,4 +783,8 @@ if __name__ == "__main__":
     print(f"  {'Model':<25} {'Baseline':>10} {'QCNN':>10} {'QEFS':>10} {'ΔAcc':>10} {'#Feat':>8}")
     print("  " + "-" * 68)
     for r in all_qefs:
-        de
+        d = r.get("qefs_test_acc", 0) - r.get("baseline_test_acc", 0)
+        print(f"  {r['model_name']:<25} {r.get('baseline_test_acc', 0):>10.4f} "
+              f"{r.get('qcnn_test_acc', 0):>10.4f} {r.get('qefs_test_acc', 0):>10.4f} "
+              f"{d:>+10.4f} {r.get('n_features_selected', 0):>8d}")
+    print("=" * 70)
